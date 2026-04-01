@@ -1,0 +1,275 @@
+<#
+PowerShell 5.1 / ISE compatible
+ 
+FLOW:
+CSV -> Dynamic Security Group -> Owners -> Access Review
+ 
+GOAL:
+Take recommendations -> Block sign-in for 30 days -> Remove user from tenant
+(implemented as disableAndDeleteUserApplyAction for INACTIVE guest users)
+ 
+References:
+- accessReviewInactiveUsersQueryScope + inactiveDuration for inactive users scoping
+- accessReviewScheduleSettings.applyActions supports disableAndDeleteUserApplyAction
+#>
+ 
+# -----------------------------
+# CONFIG
+# -----------------------------
+$CsvPath = Join-Path $env:USERPROFILE "Desktop\test.csv"
+ 
+# Must be a real USER object in Entra ID (not a shared mailbox)
+$FallbackReviewerUpn = "cybersecurity@rituals.com"
+ 
+$ReviewDurationDays = 10
+$RecurrenceMonths   = 3
+ 
+# Inactive threshold: only guests inactive >= this many days are included in the review
+# Example: 90 days inactivity
+$InactiveDays = 90
+ 
+# -----------------------------
+# CONNECT GRAPH (App-only)
+# -----------------------------
+$GraphClientId  = "00664979-8752-49ff-aa3c-01e5947b3529"
+$GraphClientKey = ""     # <-- fill in
+$GraphTenantId  = "79b45213-33b8-48f0-93e0-1ba179cfe676"
+ 
+$SecureClientSecret = ConvertTo-SecureString -String $GraphClientKey -AsPlainText -Force
+$ClientSecretCredential = New-Object System.Management.Automation.PSCredential($GraphClientId, $SecureClientSecret)
+ 
+Connect-MgGraph -TenantId $GraphTenantId -ClientSecretCredential $ClientSecretCredential
+Get-MgContext
+ 
+# -----------------------------
+# HELPERS
+# -----------------------------
+function New-MailNicknameFromName {
+  param([Parameter(Mandatory=$true)][string]$Name)
+  $nn = $Name.ToLower() -replace '[^a-z0-9]', ''
+  if ([string]::IsNullOrWhiteSpace($nn)) { $nn = "group" }
+  if ($nn.Length -gt 64) { $nn = $nn.Substring(0,64) }
+  return $nn
+}
+ 
+function Get-UserIdByUpnOrMail {
+  param([Parameter(Mandatory=$true)][string]$Identifier)
+  $filter = [uri]::EscapeDataString("userPrincipalName eq '$Identifier' or mail eq '$Identifier'")
+  $res = Invoke-MgGraphRequest -Method GET -Uri ("https://graph.microsoft.com/v1.0/users?`$filter=$filter&`$select=id,userPrincipalName,mail&`$top=1")
+  if (-not $res.value -or $res.value.Count -eq 0) { throw "User not found in tenant: $Identifier" }
+  return $res.value[0].id
+}
+ 
+function Ensure-DynamicUserSecurityGroup {
+  param(
+    [Parameter(Mandatory=$true)][string]$Name,
+    [Parameter(Mandatory=$true)][string]$Description,
+    [Parameter(Mandatory=$true)][string]$MembershipRule
+  )
+ 
+  $filter = [uri]::EscapeDataString("displayName eq '$Name'")
+  $res = Invoke-MgGraphRequest -Method GET -Uri ("https://graph.microsoft.com/v1.0/groups?`$filter=$filter&`$select=id,displayName&`$top=1")
+ 
+  if ($res.value -and $res.value.Count -gt 0) {
+    $gid = $res.value[0].id
+    $patch = @{
+      description = $Description
+      membershipRule = $MembershipRule
+      membershipRuleProcessingState = "On"
+    }
+    Invoke-MgGraphRequest -Method PATCH -Uri ("https://graph.microsoft.com/v1.0/groups/$gid") -Body ($patch | ConvertTo-Json -Depth 10) | Out-Null
+    return $gid
+  }
+ 
+  $mailNick = New-MailNicknameFromName -Name $Name
+  $body = @{
+    displayName = $Name
+    description = $Description
+    mailEnabled = $false
+    securityEnabled = $true
+    mailNickname = $mailNick
+    groupTypes = @("DynamicMembership")
+    membershipRule = $MembershipRule
+    membershipRuleProcessingState = "On"
+  }
+ 
+  $g = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups" -Body ($body | ConvertTo-Json -Depth 10)
+  return $g.id
+}
+ 
+function Ensure-GroupOwners {
+  param(
+    [Parameter(Mandatory=$true)][string]$GroupId,
+    [Parameter(Mandatory=$true)][string[]]$OwnerUpns
+  )
+ 
+  foreach ($upn in $OwnerUpns) {
+    $oid = Get-UserIdByUpnOrMail -Identifier $upn
+    $refBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$oid" }
+    try {
+      Invoke-MgGraphRequest -Method POST -Uri ("https://graph.microsoft.com/v1.0/groups/$GroupId/owners/`$ref") -Body ($refBody | ConvertTo-Json -Depth 5) | Out-Null
+    } catch {
+      # ignore if already owner
+    }
+  }
+}
+ 
+function AccessReviewExistsBeta {
+  param([Parameter(Mandatory=$true)][string]$DisplayName)
+ 
+  # FIX: must be .../definitions?`$filter=...
+  $filter = [uri]::EscapeDataString("displayName eq '$DisplayName'")
+  $uri = "https://graph.microsoft.com/beta/identityGovernance/accessReviews/definitions?`$filter=$filter&`$top=1"
+  $res = Invoke-MgGraphRequest -Method GET -Uri $uri
+  return ($res.value -and $res.value.Count -gt 0)
+}
+ 
+function New-InactiveGuestAccessReview_DisableAndDelete {
+  param(
+    [Parameter(Mandatory=$true)][string]$CompanyName,
+    [Parameter(Mandatory=$true)][string]$GroupId,
+    [Parameter(Mandatory=$true)][string]$FallbackReviewerUpn,
+    [Parameter(Mandatory=$true)][int]$InactiveDays
+  )
+ 
+  $displayName = "$CompanyName - Inactive guest accounts (Disable+Delete)"
+  if (AccessReviewExistsBeta -DisplayName $displayName) {
+    Write-Host "Access review already exists: $displayName" -ForegroundColor Yellow
+    return
+  }
+ 
+  $fallbackId = Get-UserIdByUpnOrMail -Identifier $FallbackReviewerUpn
+  $startDate = (Get-Date).ToString("yyyy-MM-dd")
+ 
+  # Inactive guest scope (only inactive users are included)
+  $scope = @{
+    "@odata.type"    = "#microsoft.graph.accessReviewInactiveUsersQueryScope"
+    queryType        = "MicrosoftGraph"
+    queryRoot        = $null
+    query            = "/v1.0/groups/$GroupId/transitiveMembers/microsoft.graph.user?`$filter=(userType eq 'Guest')"
+    inactiveDuration = ("P{0}D" -f $InactiveDays)
+  }
+ 
+  $body = @{
+    displayName = $displayName
+    descriptionForAdmins = "Access review of INACTIVE guest accounts for $CompanyName. Deny => disable ~30 days then delete."
+    descriptionForReviewers = "Please review whether these inactive guest accounts from $CompanyName still require access."
+ 
+    reviewers = @(
+      @{
+        queryType = "MicrosoftGraph"
+        query     = "/v1.0/groups/$GroupId/owners"
+        queryRoot = $null
+      }
+    )
+ 
+    fallbackReviewers = @(
+      @{
+        queryType = "MicrosoftGraph"
+        query     = "/v1.0/users/$fallbackId"
+        queryRoot = $null
+      }
+    )
+ 
+    scope = $scope
+ 
+    settings = @{
+      mailNotificationsEnabled      = $true
+      reminderNotificationsEnabled  = $true
+ 
+      recommendationsEnabled        = $true
+      defaultDecisionEnabled        = $true
+      defaultDecision               = "Recommendation"
+ 
+      instanceDurationInDays        = $ReviewDurationDays
+      autoApplyDecisionsEnabled     = $true
+ 
+      # Key: Disable then Delete action
+      applyActions = @(
+        @{ "@odata.type" = "#microsoft.graph.disableAndDeleteUserApplyAction" }
+      )
+ 
+      recurrence = @{
+        pattern = @{
+          type       = "absoluteMonthly"
+          interval   = $RecurrenceMonths
+          dayOfMonth = 1
+        }
+        range = @{
+          type      = "noEnd"
+          startDate = $startDate
+        }
+      }
+    }
+ 
+    stageSettings = @()
+    additionalNotificationRecipients = @()
+  }
+ 
+  try {
+    Invoke-MgGraphRequest -Method POST `
+      -Uri "https://graph.microsoft.com/beta/identityGovernance/accessReviews/definitions" `
+      -Body ($body | ConvertTo-Json -Depth 80) | Out-Null
+ 
+    Write-Host "Created access review: $displayName" -ForegroundColor Green
+  }
+  catch {
+    Write-Host "Access review creation FAILED for: $displayName" -ForegroundColor Red
+    if ($_.ErrorDetails) {
+      Write-Host "---- Graph ErrorDetails ----" -ForegroundColor Red
+      Write-Host $_.ErrorDetails -ForegroundColor Red
+    } else {
+      Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+    throw
+  }
+}
+ 
+# -----------------------------
+# RUN
+# -----------------------------
+if (-not (Test-Path $CsvPath)) { throw "CSV not found at: $CsvPath" }
+$rows = Import-Csv $CsvPath
+if (-not $rows) { throw "CSV is empty or unreadable: $CsvPath" }
+ 
+foreach ($r in $rows) {
+  $company   = ("" + $r.CompanyName).Trim()
+  $domain    = ("" + $r.EmailDomain).Trim()
+  $ownersRaw = ("" + $r.Owners).Trim()
+ 
+  if (-not $company)   { throw "Missing CompanyName in CSV." }
+  if (-not $domain)    { throw "Missing EmailDomain for company '$company'." }
+  if (-not $ownersRaw) { throw "Missing Owners for company '$company'." }
+ 
+  $owners = $ownersRaw.Split(";") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+  if ($owners.Count -lt 2) { throw "Company '$company' must have at least 2 owners in Owners." }
+ 
+  $groupName = "O365-RIT-GuestUsers-$company"
+  $groupDesc = "Group containing all Guest acccounts from businesss partner $company."
+ 
+  # Keep EXACT membership rule you confirmed works
+  $membershipRule = '(user.mail -contains "@' + $domain.Trim().ToLower() + '")'
+ 
+  Write-Host ""
+  Write-Host ("--- {0} ---" -f $company) -ForegroundColor Cyan
+  Write-Host ("Group: {0}" -f $groupName)
+  Write-Host ("Rule : {0}" -f $membershipRule)
+ 
+  $gid = Ensure-DynamicUserSecurityGroup -Name $groupName -Description $groupDesc -MembershipRule $membershipRule
+  if (-not $gid) { throw "Group creation failed for $company." }
+  Write-Host ("Group OK: {0}" -f $gid) -ForegroundColor Green
+ 
+  Ensure-GroupOwners -GroupId $gid -OwnerUpns $owners
+  Write-Host "Owners OK" -ForegroundColor Green
+ 
+  # Create Access Review: INACTIVE guests only + Disable & Delete apply action
+  New-InactiveGuestAccessReview_DisableAndDelete `
+    -CompanyName $company `
+    -GroupId $gid `
+    -FallbackReviewerUpn $FallbackReviewerUpn `
+    -InactiveDays $InactiveDays
+}
+ 
+Write-Host ""
+Write-Host "DONE" -ForegroundColor Green
+ 
